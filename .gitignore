@@ -1,0 +1,37 @@
+# Published: the sources of the tester, the script the README uses, the
+# ready-made tester, the pictures and the videos. Everything else stays local:
+# the FNIRSI firmware and anything made from it (fw/, usb/, releases/,
+# update/), the Spectrum (src/zx), the test builds that run over SWD and their
+# tools, notes.
+/*
+!/.gitignore
+!/README.md
+!/platformio.ini
+!/src/
+!/tools/
+!/bin/
+!/docs/
+
+/src/*
+!/src/app/
+!/src/boot/
+!/src/hw/
+/src/hw/*
+!/src/hw/Lcd.cpp
+!/src/hw/Lcd.h
+!/src/hw/Probe.cpp
+!/src/hw/Probe.h
+# built without them (NO_USB_SENDER)
+/src/app/TtlApp.*
+/src/app/Export.cpp
+
+/tools/*
+!/tools/make_update.py
+
+/bin/*
+!/bin/APRE-210_v0.27.bin
+
+/docs/*
+!/docs/demo.gif
+!/docs/demo.mp4
+!/docs/waveraid.mp4

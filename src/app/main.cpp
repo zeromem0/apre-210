@@ -1,0 +1,1454 @@
+// DST-210 (apre-210: apre-510 with the DST-210 board of dst210-link) as an RS232 protocol inspector on the analogue input: T232USB
+// (dso152-tester232-usb) carried over from the DSO-152.
+//
+// Nothing arrives over a USART here. The BNC goes through the scope's own
+// front end into the 8-bit converter, TMR4 paces it, DMA1 fills a circular
+// buffer, and the byte stream is recovered from those samples. The front end
+// takes RS232 swings directly, so no MAX3232 sits in front of it.
+//
+// It lives in flash after the FNIRSI application and is started instead of
+// it when RUN is held at power-on (src/boot/BootStub.S). Test builds run from
+// RAM, loaded over SWD (RAM_RUN); those tools are not published.
+//
+// The instrument starts on a menu (Menu.cpp): this inspector; the USB Sender
+// (TtlApp.cpp), which sends what the inspector received to a PC or a phone
+// over the instrument's own USB socket, a CDC serial port (UsbFix.cpp); and
+// Settings (SetApp.cpp): the theme, the export format, auto off and erasing
+// the buffer, kept in RAM until power off (Config.cpp). OK held brings any of
+// them back to the menu. What was received stays in the buffer until it is
+// erased. With NO_USB_SENDER (flash_apre) the menu is AprecID, the tester and
+// Settings, and Settings has no Export and Block rows.
+
+#include <Arduino.h>
+#include "Pins.h"
+#include "Lcd.h"
+#include "Theme.h"
+#include "DisplayHex.h"
+#include "DisplayChars.h"
+#include "DisplayLarge.h"
+#include "Acquire.h"
+#include "Frontend.h"
+#include "Rs232.h"
+#include "ProtMode.h"
+#include "Keys.h"
+#include "Menu.h"
+#ifndef NO_USB_SENDER
+#include "TtlApp.h"
+#endif
+#include "SetApp.h"
+#include "Config.h"
+#include "UsbFix.h"
+#include "Teach.h"
+#include "Health.h"
+#include "Inspector.h"
+#include "DemoSig.h"
+#include "Probe.h"
+#include "Version.h"
+#include "Beep.h"
+#include "Link.h"
+#include "Meter.h"
+#include "Logger.h"
+#include "Game.h"
+#include "CalOut.h"
+#ifdef ZX
+#include "../zx/Zx.h"
+#endif
+
+Lcd tft;
+
+#define APP_MENU    0
+#define APP_TESTER  1
+#define APP_TTL     3
+#define APP_SET     4
+#define APP_INSP    5       // what is on the probe (Inspector.cpp)
+#define APP_LOG     6       // the multimeter and the scope input over a minute (Logger.cpp)
+#define APP_GAME    7       // Wave Raid (Game.cpp), from Startup
+static uint8_t app = APP_MENU;
+
+#define SCREEN_WIDTH  320
+#define SCREEN_HEIGHT 240
+
+#define MODE_PROT   0
+#define MODE_HEX    1
+#define MODE_CHARS  2
+#define MODE_LARGE  3
+#define MODE_TEACH  4       // one character, drawn to be learnt from (Teach.cpp)
+#define MODE_HEALTH 5       // the electrical side of the line, as the Fluke 125 tests it (Health.cpp)
+#define NUM_MODES   6
+
+// The order MODE goes through them in, which is not the order of the numbers:
+// the two views drawn from the waveform first, then the text ones.
+static const uint8_t MODE_ORDER[NUM_MODES] = { MODE_PROT, MODE_TEACH, MODE_HEALTH, MODE_LARGE, MODE_HEX, MODE_CHARS };
+static uint8_t nextMode(uint8_t m) {
+    for (uint8_t i = 0; i < NUM_MODES; i++)
+        if (MODE_ORDER[i] == m) return MODE_ORDER[(i + 1) % NUM_MODES];
+    return MODE_PROT;
+}
+
+#define BUFFER_SIZE 2048
+static char dataBuffer[BUFFER_SIZE];
+static int  bufferIndex = 0;
+static int  lastBufferIndex = 0;
+
+static uint8_t  displayMode = MODE_PROT;
+static volatile bool running = true;
+static int      lastDisplayedLines = 0;
+static int      scrollFirstLine = -1;
+
+// Pick the rate for the line speed: about ten samples a bit is enough to
+// decode and leaves the most of the traffic on screen. 100 kS/s suits 9600,
+// 250 k suits 19200 and 38400, 1.25 M suits 115200. Starting at the slowest
+// because 9600 is what turns up most often.
+static const uint32_t RATES[] = { 100000, 250000, 500000, 1250000, 2000000 };
+static uint8_t rateIdx = 0;
+
+// AUTO steps through these. The two fixed speeds bring their own sample rate,
+// a little over ten samples a bit, and work the frame out from the line (they
+// were 8N1 outright: on a 9600 8E1 line half the characters were lost). A
+// works the speed and the frame out, at whatever rate UP and DOWN have set.
+// L (locked) keeps what A found, speed and frame, and learns nothing more: a
+// line that sends a message now and then has each one read from its first
+// edge, with no learning again between them. Offered only once A has found
+// both; after it AUTO goes back to 9600.
+#define SPEED_9600   0
+#define SPEED_19200  1
+#define SPEED_AUTO   2
+#define SPEED_LOCK   3
+static uint8_t speedMode = SPEED_9600;
+static uint32_t lockBaud;               // what L holds
+static Rs232::Format lockFmt;
+
+
+
+// (Since v0.18 SNAP arms itself again once a picture is shown, but in the
+// teaching view: on a line that sends a message every half minute nobody has
+// a hand free for RUN. The picture stays until the next message replaces it;
+// the text of each is kept in the buffer, a line each in the text view.)
+// RUN steps through RUN, HOLD and SNAP. SNAP is a single shot: it waits for
+// the first start bit, keeps the samples from just before it for as long as
+// SNAP_CHARS characters take, and stops with them on the screen, so that a
+// message that would be gone in a blink under RUN can be looked at and
+// photographed. RUN pressed on a picture waits for the next one; pressed
+// while still waiting it goes back to RUN.
+//
+// The picture holds SNAP_CHARS characters, but the message is received to
+// its end: reading goes on after the picture is full, until the line has
+// been at rest for SNAP_REST_MS or SNAP_MAX_CHARS have come. A scanned label
+// longer than the picture is then all in the buffer, and its suffix can be
+// looked at in the other views without scanning it again. Reading stops at
+// the end of a block, so a few more than SNAP_MAX_CHARS may be taken.
+#define SNAP_OFF    0
+#define SNAP_ARMED  1       // nothing yet
+#define SNAP_FILL   2       // the start bit has come, samples are being kept
+#define SNAP_DONE   3       // received to the end, not painted yet
+#define SNAP_SHOWN  4
+#define SNAP_TAIL   5       // the picture is full, the rest of the message is being read
+#define SNAP_CHARS      8
+#define SNAP_MAX_CHARS  128     // a whole line of text with room over (was 32)
+#define SNAP_REST_MS    50
+static volatile uint8_t snap = SNAP_OFF;
+static uint32_t snapBytes0 = 0;     // the count of characters when the message began
+static uint32_t snapRest = 0;       // samples gone by with no start bit in them
+
+
+// The waveform is drawn from a copy, not from the DMA buffer. A half lasts
+// 410 us at 1.25 MS/s and the screen is only redrawn eight times a second,
+// so by the time anything was painted the live buffer would have been
+// written over several times and the trace would tear.
+static uint32_t lastWaveMs = 0;
+//
+// SNAP keeps its samples here too. A message starts anywhere in a half, so
+// its picture runs over into the next one, and the length is what eight
+// characters need at the widest of the fixed speeds: 19200 at 250 kS/s is 13
+// samples a bit, 1081 for eight frames with the lead in.
+#define SNAP_LEN 1152
+static uint16_t waveSnap[SNAP_LEN];
+static uint16_t waveN = 0;
+static uint16_t snapFull = 0;       // what the capture holds; review() may show less of it
+
+// Called with each block once it has been fed to the decoder, from wherever
+// that happened. A block that went by unread while the picture was being
+// filled leaves a gap, and the picture ends at what was kept before it.
+T232_RAM static void snapBlock(const uint16_t* s, uint16_t n, bool over) {
+    uint16_t from = 0;
+    bool started = Rs232::firstStart() >= 0;
+
+    if (snap == SNAP_ARMED) {
+        if (!started) {
+            snapBytes0 = Rs232::stats().bytes;      // nothing of the message yet
+            return;
+        }
+        uint32_t pre = (Rs232::stats().bitSamples >> 8) * 2u;   // two bits of rest
+        if (pre > 64) pre = 64;
+        uint32_t at = (uint32_t)Rs232::firstStart();
+        from  = at > pre ? (uint16_t)(at - pre) : 0;
+        waveN = 0;
+        snap  = SNAP_FILL;
+    } else if (snap == SNAP_FILL) {
+        if (over) snap = SNAP_TAIL;                 // a gap: the picture ends here
+    } else if (snap != SNAP_TAIL) {
+        return;
+    }
+
+    if (snap == SNAP_FILL) {
+        uint16_t take = (uint16_t)(n - from);
+        if (take > (uint16_t)(SNAP_LEN - waveN)) take = (uint16_t)(SNAP_LEN - waveN);
+        memcpy(waveSnap + waveN, s + from, (size_t)take * sizeof(uint16_t));
+        waveN = (uint16_t)(waveN + take);
+        if (waveN >= SNAP_LEN) snap = SNAP_TAIL;
+    }
+
+    // The message is over when the line has rested, or is long enough.
+    snapRest = started ? 0 : snapRest + n;
+    bool rested = snapRest * 1000u >= Acq::sampleRate() * SNAP_REST_MS;   // both well within 32 bits
+    bool enough = (Rs232::stats().bytes - snapBytes0) >= SNAP_MAX_CHARS;
+    if (rested || enough) {
+        running = false;
+        snap    = SNAP_DONE;
+    }
+}
+
+#ifndef DEMO_SIGNAL
+// The decoder runs in the DMA interrupt, so no sample is missed while the
+// screen is painted. The screen asks for a picture with wantSnap; the
+// interrupt copies the half it has just decoded, together with the marks
+// that go with it, and answers with snapReady. Nothing is asked for while a
+// picture is being painted, so the copy is never written under the painter.
+static volatile bool wantSnap = false, snapReady = false;
+
+T232_RAM static void onBlock(const uint16_t* s, uint16_t n, bool over) {
+    if (!running) return;
+    if (over) Rs232::noteOverrun();
+    Rs232::feed(s, n, Acq::sampleRate(), Acq::lastLo(), Acq::lastHi());
+    if (snap != SNAP_OFF) { snapBlock(s, n, over); return; }
+    if (wantSnap) {
+        waveN = n > (uint16_t)(Acq::BUF_LEN / 2) ? (uint16_t)(Acq::BUF_LEN / 2) : n;
+        memcpy(waveSnap, s, (size_t)waveN * sizeof(uint16_t));
+        Rs232::latchView();
+        wantSnap  = false;
+        snapReady = true;
+    }
+}
+#endif
+
+#ifdef DEMO_SIGNAL
+// A line that is not there, behaving like a hand scanner on a real adapter:
+// a second of rest first, then a short message at 9600 8N1 with the
+// characters back to back, then half a second of rest, and so on. The levels
+// are those of the real adapter (about -9 V and +10 V, as simulateMessage()
+// has them) on the range in force, with twenty counts of noise, and at rest
+// a bump of sixty counts a quarter of a millisecond wide every so often,
+// which on the DSO-152 was once taken for traffic. For the pictures of the
+// screens (local tools), never for a unit in use.
+static uint16_t demoBuf[Acq::BUF_LEN / 2];
+static const char DEMO_TEXT[] = "Apreciometru RS232\r";
+static uint8_t  demoChar = 0, demoBit = 0;
+static uint32_t demoAcc = 0, demoIdle = 100000;
+static uint16_t demoNoise = 1, demoBump = 0;
+
+static const uint16_t* demoBlock(uint16_t& n, uint32_t sampleHz) {
+    const uint32_t baud = 9600;
+    n = (uint16_t)(Acq::BUF_LEN / 2);
+    const int32_t zero = Frontend::zeroCounts(), cpv = Frontend::countsPerVolt();
+    const int16_t lo = (int16_t)constrain(zero - cpv * 9, 16, 4000);
+    const int16_t hi = (int16_t)constrain(zero + cpv * 10, 16, 4000);
+
+    for (uint16_t i = 0; i < n; i++) {
+        // bit 0 is the start, 1..8 the data, 9 the stop
+        bool mark = true;
+        if (demoIdle) {
+            demoIdle--;
+            if ((demoIdle % 1700u) == 0) demoBump = 26;
+        } else {
+            uint8_t c = (uint8_t)DEMO_TEXT[demoChar];
+            if (demoBit == 0)      mark = false;
+            else if (demoBit <= 8) mark = ((c >> (demoBit - 1)) & 1) != 0;
+
+            demoAcc += baud;
+            if (demoAcc >= sampleHz) {
+                demoAcc -= sampleHz;
+                if (++demoBit >= 10) {
+                    demoBit = 0;
+                    if (DEMO_TEXT[++demoChar] == 0) {
+                        demoChar = 0;
+                        demoIdle = sampleHz / 2;
+                    }
+                }
+            }
+        }
+
+        demoNoise = (uint16_t)(demoNoise * 1103u + 12345u);
+        int16_t v = (int16_t)((mark ? lo : hi) + (int16_t)((demoNoise >> 9) & 0x1F) - 16);
+        if (demoBump) { demoBump--; v += 60; }
+        demoBuf[i] = (uint16_t)v;
+    }
+    return demoBuf;
+}
+#endif
+
+static void updateStatusBar() {
+    Rs232::Stats st = Rs232::stats();
+    tft.fillRect(0, 0, SCREEN_WIDTH, 20, TH.bar);
+    tft.setTextSize(1);
+    tft.setTextColor(TH.barText, TH.bar);
+
+    tft.setCursor(2, 6);
+    tft.print(snap == SNAP_OFF ? (running ? "RUN " : "HOLD")
+                                    : (running ? "WAIT" : "SNAP"));
+
+    tft.setCursor(44, 6);
+    tft.print("R");
+    tft.print(Frontend::range());
+    tft.print(Frontend::couplingDC() ? " DC" : " AC");
+
+    tft.setCursor(110, 6);
+    if (speedMode == SPEED_AUTO) tft.print("A ");
+    if (speedMode == SPEED_LOCK) tft.print("L ");
+    if (st.locked && st.baud) {
+        Rs232::Format f = Rs232::format();
+        tft.print(st.baud);
+        tft.print(' ');
+        tft.print(f.dataBits);
+        tft.print(f.parity);
+        tft.print(f.stopBits);
+        if (!f.decided) tft.print('?');     // still striking candidates out
+    } else {
+        tft.print("baud ?");
+    }
+
+    tft.setCursor(200, 6);
+    tft.print(Rs232::inverted() ? "RS232" : "TTL");
+
+    tft.setCursor(240, 6);
+    tft.print(st.bytes);
+    tft.print(" B");
+}
+
+// The byte count moves all the time, the rest of the bar hardly ever, so the
+// count is rewritten on its own and the bar only when something in it changed.
+static void updateByteCount() {
+    tft.setTextSize(1);
+    tft.setTextColor(TH.barText, TH.bar);
+    tft.setCursor(240, 6);
+    tft.print(Rs232::stats().bytes);
+    tft.print(" B  ");
+}
+
+static void refreshStatusBar() {
+    static uint32_t lastMs = 0, lastKey = 0;
+    uint32_t now = millis();
+    if (now - lastMs < 500) return;
+    lastMs = now;
+
+    Rs232::Stats  st = Rs232::stats();
+    Rs232::Format f  = Rs232::format();
+    uint32_t key = (st.locked ? st.baud : 0)
+                 ^ ((uint32_t)f.dataBits << 28) ^ ((uint32_t)f.parity << 20)
+                 ^ ((uint32_t)f.stopBits << 26) ^ ((uint32_t)f.decided << 31);
+    if (key != lastKey) { lastKey = key; updateStatusBar(); }
+    else                updateByteCount();
+}
+
+static void paintProt() {
+    Prot::drawWave(tft, waveSnap, waveN);
+    Prot::drawBus(tft, waveN);
+    Prot::drawLevels(tft, Acq::sampleRate(), dataBuffer, bufferIndex);
+}
+
+// The levels are held from one message to the next, so anything that moves
+// them on the ADC -- another range, the coupling -- has to start them again.
+static void paintWaves();
+
+// The decoder starts again. Not while a capture is on the screen: that is
+// read again at once, with levels taken from itself and the speed it was
+// read at, and the decoder starts again when the next capture is asked for.
+// Thrown away there, the speed went with it, and the teaching view found no
+// start bit in the capture until RUN.
+static bool relearnPending = false;
+
+static void relearn() {
+    Acq::pause();
+    bool shown = snap == SNAP_SHOWN;
+    if (shown) {
+        relearnPending = true;
+        Rs232::levelsFrom(waveSnap, snapFull);
+        waveN = Rs232::review(waveSnap, snapFull, SNAP_CHARS);
+    } else {
+        Rs232::reset();
+    }
+    Acq::resume();
+    if (shown) paintWaves();
+}
+
+static void applySpeedMode() {
+    if (speedMode == SPEED_9600)  rateIdx = 0;
+    if (speedMode == SPEED_19200) rateIdx = 1;
+    Acq::setSampleRate(RATES[rateIdx]);
+    Acq::pause();
+    if (speedMode == SPEED_LOCK) {
+        Rs232::setFixedBaud(lockBaud);
+        Rs232::setFixedFrame(lockFmt.dataBits, lockFmt.parity, lockFmt.stopBits);
+    } else {
+        Rs232::setFixedBaud(speedMode == SPEED_9600 ? 9600 : speedMode == SPEED_19200 ? 19200 : 0, true);
+    }
+    Rs232::reset();
+    Acq::resume();
+}
+
+// AUTO keeps the rate to the line (apre-510 v0.10+): the speed found, read at
+// under 8 samples a bit, steps the rate up; over 40, down. Up to 1.25 MS/s
+// (at 2 MS/s the decoder no longer keeps up). Before, AUTO learnt only the
+// speed: opened at 100 kS/s for 9600 and then given 115200, it read one
+// sample a bit and showed rubbish ("57600 8E2") until UP was pressed.
+static const uint8_t RATE_AUTO_MAX = 3;          // 1.25 MS/s
+
+static void autoRate() {
+    static uint32_t lastMs;
+    if (speedMode != SPEED_AUTO || !running || snap != SNAP_OFF || displayMode == MODE_HEALTH) return;
+    if (millis() - lastMs < 300) return;
+    lastMs = millis();
+    Rs232::Stats st = Rs232::stats();
+    if (!st.locked || !st.bitSamples) return;
+    uint8_t to = rateIdx;
+    if (st.bitSamples < (8u << 8) && rateIdx < RATE_AUTO_MAX) to++;
+    else if (st.bitSamples > (40u << 8) && rateIdx > 0)     to--;
+    if (to == rateIdx) return;
+    rateIdx = to;
+    Acq::setSampleRate(RATES[rateIdx]);
+    Acq::pause();
+    Rs232::reset();
+    Acq::resume();
+    updateStatusBar();
+}
+
+// Where the line rested before a character, and for how long: the text view
+// starts a line there and says the time. Kept for the last GAPS_MAX.
+#define GAP_MS    300
+#define GAPS_MAX  24
+static CharsGap gaps[GAPS_MAX];
+static uint8_t  gapN = 0;
+static uint32_t lastRxMs = 0;
+
+static void noteGap() {
+    uint32_t now = millis();
+    if (bufferIndex > 0 && lastRxMs && now - lastRxMs >= GAP_MS) {
+        if (gapN == GAPS_MAX) { memmove(gaps, gaps + 1, sizeof(gaps) - sizeof(gaps[0])); gapN--; }
+        gaps[gapN].at = bufferIndex;
+        gaps[gapN].ms = now - lastRxMs;
+        gapN++;
+    }
+    lastRxMs = now;
+}
+
+static void compactBuffer() {
+    const int keep = BUFFER_SIZE / 2;
+    memmove(dataBuffer, dataBuffer + bufferIndex - keep, keep);
+    int shift = bufferIndex - keep;
+    uint8_t k = 0;
+    for (uint8_t i = 0; i < gapN; i++)
+        if (gaps[i].at - shift > 0) { gaps[k] = gaps[i]; gaps[k].at -= shift; k++; }
+    gapN = k;
+    lastDisplayedLines = 0;             // every row of the text view has moved
+    bufferIndex = keep;
+    dataBuffer[bufferIndex] = 0;
+    lastBufferIndex = 0;
+    scrollFirstLine = -1;
+}
+
+static void drainDecoder() {
+    int c;
+    while ((c = Rs232::read()) >= 0) {
+        if (c > 0xFF) continue;                 // a LIN break: only the inspector asks for those
+        if (bufferIndex >= BUFFER_SIZE - 1) compactBuffer();
+        noteGap();
+        dataBuffer[bufferIndex++] = (char)c;
+        dataBuffer[bufferIndex] = 0;
+        Link::rx((uint8_t)c, "tester");
+    }
+}
+
+static void updateTextMode(bool hex) {
+    if (!hex) {                         // the text: a line for each message, under a rule
+        displayCharsLines(tft, dataBuffer, bufferIndex, gaps, gapN, lastDisplayedLines == 0);
+        lastDisplayedLines = 1;
+        return;
+    }
+    const int perLine  = hex ? HEX_PER_LINE  : CHARS_PER_LINE;
+    const int visLines = hex ? HEX_VIS_LINES : CHARS_VIS_LINES;
+    const int lineH    = hex ? HEX_LINE_H    : CHARS_LINE_H;
+
+    int totalLines = (bufferIndex + perLine - 1) / perLine;
+    int firstLine  = totalLines > visLines ? totalLines - visLines : 0;
+
+    if (lastDisplayedLines == 0 || firstLine != scrollFirstLine) {
+        tft.fillRect(0, 20, SCREEN_WIDTH, SCREEN_HEIGHT - 20, TH.bg);
+        if (hex) displayHex(tft, dataBuffer, bufferIndex, firstLine);
+        else     displayChars(tft, dataBuffer, bufferIndex, firstLine);
+        scrollFirstLine = firstLine;
+        lastDisplayedLines = 1;
+        return;
+    }
+    int fromLine = lastBufferIndex / perLine;
+    if (fromLine < firstLine) fromLine = firstLine;
+    for (int ln = fromLine; ln < totalLines; ln++) {
+        int y = 20 + (ln - firstLine) * lineH;
+        if (hex) displayHexLine(tft, dataBuffer, bufferIndex, ln, y);
+        else     displayCharsLine(tft, dataBuffer, bufferIndex, ln, y);
+    }
+}
+
+static void redrawAll() {
+    tft.fillScreen(TH.bg);
+    updateStatusBar();
+    lastDisplayedLines = 0;
+    scrollFirstLine = -1;
+    if (displayMode == MODE_PROT) {
+        Prot::drawChrome(tft);
+        if (snap == SNAP_SHOWN) paintProt();
+    }
+    if (displayMode == MODE_TEACH) Teach::draw(tft, waveSnap, waveN, !running);
+    if (displayMode == MODE_HEALTH) Health::draw(tft);
+}
+
+// The two views drawn from a snapshot of the samples. The teaching one is
+// redrawn whole, so less often, or it would flicker.
+static bool wavesShown() { return displayMode == MODE_PROT || displayMode == MODE_TEACH; }
+static uint32_t waveEveryMs() { return displayMode == MODE_TEACH ? 600 : 120; }
+static void paintWaves() {
+    if (displayMode == MODE_PROT)  paintProt();
+    if (displayMode == MODE_TEACH) Teach::draw(tft, waveSnap, waveN, !running);
+}
+
+// Asked for from Settings. Whatever was decoded but not yet collected goes
+// too, or it would turn up in the empty buffer the next time round.
+static void eraseBuffer() {
+    while (Rs232::read() >= 0) {}
+    Rs232::clearCounts();               // the errors were of what has just gone
+    bufferIndex = 0;
+    dataBuffer[0] = 0;
+    lastBufferIndex = 0;
+    lastDisplayedLines = 0;
+    gapN = 0;
+    scrollFirstLine = -1;
+}
+
+// The same, with the picture left on the screen until the next one comes.
+static void rearmSnap() {
+    Acq::pause();
+    if (relearnPending) { Rs232::reset(); relearnPending = false; }
+#ifndef DEMO_SIGNAL
+    wantSnap = false; snapReady = false;
+#endif
+    snap    = SNAP_ARMED;
+    snapBytes0 = Rs232::stats().bytes;
+    snapRest   = 0;
+    running = true;
+    Acq::resume();
+    updateStatusBar();
+}
+
+static void armSnap() {
+    Acq::pause();
+    if (relearnPending) { Rs232::reset(); relearnPending = false; }
+#ifndef DEMO_SIGNAL
+    wantSnap = false; snapReady = false;
+#endif
+    snap    = SNAP_ARMED;
+    snapBytes0 = Rs232::stats().bytes;
+    snapRest   = 0;
+    running = true;
+    Acq::resume();
+    displayMode = MODE_PROT;            // the picture is drawn nowhere else
+    redrawAll();
+}
+
+// The samples are all in. They are read once more from the top, this time
+// for the marks and the characters that belong to exactly this stretch.
+// A message that never came down the line: "Apreciometru RS232" and CR LF,
+// made into samples the way the line would bring them, at the speed and the
+// sample rate in force, and put through the decoder and the capture exactly
+// as a block from the converter is. The waveform, the characters under it
+// and the buffer then show it as if it had been received, which is a way to
+// see every view working with nothing on the probe.
+//
+// The levels are those a real adapter gave on range 7, either side of zero
+// volts; in TTL mode the other way up, since there the line rests high.
+static void simulateMessage() {
+    static const char MSG[] = "Apreciometru RS232\r\n";
+    Rs232::Stats st = Rs232::stats();
+    uint32_t hz   = Acq::sampleRate();
+    uint32_t baud = Rs232::fixedBaud() ? Rs232::fixedBaud()
+                  : (st.locked && st.baud) ? st.baud : 9600;
+    bool     inv  = Rs232::inverted();
+    // RS232: the levels of the real adapter, about -9 V and +10 V, on the
+    // range in force. TTL: 0 V and 3.3 V. The most sensitive ranges clip.
+    int32_t  zero  = Rs232::zeroCounts();
+    int32_t  cpv   = Frontend::countsPerVolt();
+    int32_t  up    = zero + cpv * 33 / 10;
+    int32_t  m9    = zero - cpv * 9;
+    int32_t  p10   = zero + cpv * 10;
+    uint16_t mark  = (uint16_t)constrain(inv ? m9 : up, 16, 4000);
+    uint16_t space = (uint16_t)constrain(inv ? p10 : zero, 16, 4000);
+
+    Acq::pause();                       // no real block may come in between
+    uint16_t blk[256];
+    uint16_t ch = 0, bit = 0, noise = 1;
+    uint32_t acc = 0, lead = 30;        // some rest first, for the start bit to stand out
+    bool     sending = true;
+
+    // Blocks until the capture says the message is over, which it does once
+    // the line has rested after it. The guard is far beyond what that takes.
+    for (uint16_t guard = 0; snap != SNAP_DONE && guard < 600; guard++) {
+        IWDG->KR = 0xAAAA;
+        for (uint16_t i = 0; i < 256; i++) {
+            bool m = true;
+            if (lead) {
+                lead--;
+            } else if (sending) {
+                uint8_t c = (uint8_t)MSG[ch];
+                if (bit == 0)      m = false;                   // start
+                else if (bit <= 8) m = ((c >> (bit - 1)) & 1) != 0;
+                acc += baud;
+                if (acc >= hz) {
+                    acc -= hz;
+                    if (++bit >= 10) { bit = 0; if (MSG[++ch] == 0) sending = false; }
+                }
+            }
+            noise = (uint16_t)(noise * 1103u + 12345u);
+            blk[i] = (uint16_t)((m ? mark : space) + ((noise >> 9) & 15) - 8);
+        }
+        Rs232::feed(blk, 256, hz);
+        snapBlock(blk, 256, false);
+    }
+
+    Acq::discard();                     // what the converter did meanwhile is not wanted
+    Acq::resume();
+}
+
+static void showSnap() {
+    drainDecoder();
+    snapFull = waveN;
+    Rs232::levelsFrom(waveSnap, snapFull);
+    waveN = Rs232::review(waveSnap, waveN, SNAP_CHARS);
+    snap  = SNAP_SHOWN;
+    Teach::select(0);
+    paintWaves();
+    Link::wave(waveSnap, snapFull, Acq::sampleRate(), "tester", "snap", true);
+    updateStatusBar();
+}
+
+// The threshold by hand, from the teaching view. On a capture that is on
+// the screen, the capture is read again with it, so that what a threshold
+// in the wrong place does to the bits can be seen.
+static void setThresholdTo(uint16_t th) {
+    Acq::pause();
+    if (snap == SNAP_SHOWN && !th) Rs232::levelsFrom(waveSnap, snapFull);
+    Rs232::setThreshold(th);
+    // read again from the whole capture: a threshold in the wrong place can
+    // find an earlier start, and the stretch shown would be cut short with it
+    if (snap == SNAP_SHOWN) waveN = Rs232::review(waveSnap, snapFull, SNAP_CHARS);
+    Acq::resume();
+    Teach::draw(tft, waveSnap, waveN, !running);
+}
+
+static void moveThreshold(int8_t d) {
+    Rs232::Stats st = Rs232::stats();
+    int32_t step = (st.levels && st.hi > st.lo) ? (st.hi - st.lo) / 20 : 16;
+    if (step < 4) step = 4;
+    int32_t th = (int32_t)st.threshold + d * step;
+    if (th < 1)    th = 1;
+    if (th > 4094) th = 4094;
+    setThresholdTo((uint16_t)th);
+}
+
+static void updateDisplay() {
+    if (displayMode == MODE_TEACH) return;          // drawn from the samples, in paintWaves()
+    if (displayMode == MODE_HEALTH) return;         // drawn by Health::poll()
+    if (displayMode == MODE_PROT) {
+        if (bufferIndex != lastBufferIndex || lastDisplayedLines == 0) {
+            Prot::drawStream(tft, dataBuffer, bufferIndex);
+            lastBufferIndex = bufferIndex;
+            lastDisplayedLines = 1;
+        }
+        return;
+    }
+
+    if (bufferIndex != lastBufferIndex || lastDisplayedLines == 0) {
+        switch (displayMode) {
+            case MODE_HEX:   updateTextMode(true);  break;
+            case MODE_CHARS: updateTextMode(false); break;
+            case MODE_LARGE: {
+                int startPos = (bufferIndex >= 32) ? bufferIndex - 32 : 0;
+                if (largeBufferChanged(dataBuffer, bufferIndex, startPos)
+                    || lastDisplayedLines == 0) {
+                    displayLarge(tft, dataBuffer, bufferIndex, startPos);
+                    lastDisplayedLines = 1;
+                }
+                break;
+            }
+        }
+        lastBufferIndex = bufferIndex;
+    }
+}
+
+// Coming in from the menu. Whatever button is still down from the choosing
+// is taken as seen, and the half that settled while nothing was collecting
+// is let go rather than counted as lost.
+// The bus health view samples at 2 MS/s and has the samples to itself: the
+// decoder is not fed while it is up. Its blocks are polled, since at that
+// rate an interrupt per half would leave the loop nothing.
+//
+// A half lasts 0.5 ms here, less than drawing the table takes. After a
+// drawing both halves have gone by and the one handed over may be the one
+// being written, and its seam made jitter, rise, fall and the bit time
+// creep worse every few seconds. So a half that comes after an overrun is
+// let go, and a fresh one is copied out and kept only if the DMA has not
+// reached it by the end of the copy.
+#ifndef DEMO_SIGNAL
+static uint16_t healthCopy[Acq::BUF_LEN / 2];
+#endif
+static const uint16_t* healthSource(uint16_t& n) {
+#ifdef DEMO_SIGNAL
+    return demoBlock(n, Acq::sampleRate());
+#else
+    if (Config::demo) return DemoSig::block(n, Acq::sampleRate());     // the inspector's made-up line
+    bool over;
+    const uint16_t* s = Acq::readyHalf(n, over);
+    if (!s || over) return nullptr;
+    memcpy(healthCopy, s, n * sizeof(uint16_t));
+    return Acq::halfIntact() ? healthCopy : nullptr;
+#endif
+}
+
+static void healthEnter() {
+    Acq::pause();
+    // A capture under way would never be filled while this view has the
+    // samples; one on the screen, or a held screen, is kept for afterwards.
+    if (snap == SNAP_ARMED || snap == SNAP_FILL || snap == SNAP_TAIL) {
+        snap    = SNAP_OFF;
+        running = true;
+    }
+#ifndef DEMO_SIGNAL
+    wantSnap = false; snapReady = false;
+#endif
+    Acq::setSampleRate(Health::SAMPLE_HZ);
+    Acq::discard();
+    Health::enter(tft, healthSource, Acq::sampleRate());
+}
+
+static void healthLeave() {
+    Acq::setSampleRate(RATES[rateIdx]);
+    Acq::discard();
+    Acq::resume();
+}
+
+static void setMode(uint8_t m) {
+    if (displayMode == MODE_HEALTH && m != MODE_HEALTH) healthLeave();
+    displayMode = m;
+    redrawAll();
+    if (m == MODE_HEALTH) healthEnter();
+}
+
+static void testerEnter() {
+    Keys::sync();
+    redrawAll();
+    Acq::discard();
+    Acq::resume();
+    if (displayMode == MODE_HEALTH) healthEnter();
+}
+
+// The inspector takes the converter, the range and the decoder for itself
+// while it is up; the tester's own are put back when it is left for the
+// menu, or set from what was found when OK hands it over to the tester.
+static void showMenu();
+static uint8_t inspRange;
+static bool    inspInverted;
+// The tester was opened from AprecID (OK, AUTO or DOWN there): MODE past the
+// last view goes back to it.
+static bool    fromInsp;
+
+// With Demo on (Settings), the inspector's own made-up lines (DemoSig.cpp),
+// fetched by its loop: no block function, so nothing from the converter
+// reaches it through the interrupt.
+static const uint16_t* inspSource(uint16_t& n, bool& over) {
+    if (Config::demo) {
+        over = false;
+        return DemoSig::block(n, Acq::sampleRate());
+    }
+    return Acq::readyHalf(n, over);
+}
+
+static void inspEnter() {
+    inspRange    = Frontend::range();
+    inspInverted = Rs232::inverted();
+    Acq::pause();
+    Acq::onBlock(Config::demo ? nullptr : Insp::block);
+    Insp::enter(tft, inspSource);
+}
+
+// Back with the tester's block function, and its speed and rate (from
+// speedMode and rateIdx), learning afresh.
+static void inspRestore() {
+    Acq::pause();
+#ifndef DEMO_SIGNAL
+    Acq::onBlock(onBlock);
+#endif
+    while (Rs232::read() >= 0) {}
+    Rs232::setZeroCross(true);
+    Rs232::setBreaks(false);
+    applySpeedMode();
+}
+
+static void inspLeave() {
+    Frontend::setRange(inspRange);
+    Rs232::setInverted(inspInverted);
+    inspRestore();
+    Acq::pause();                       // nothing is read in the menu
+}
+
+// The Logger reads the converter itself (ScopeDc.cpp); after it the tester
+// gets back its range, block function and rate, as after AprecID.
+static uint8_t logRange;
+static void logEnter() {
+    logRange = Frontend::range();
+    app = APP_LOG;
+    Logger::enter(tft);
+}
+static void logLeave() {
+    Logger::leave();
+    Frontend::setRange(logRange);
+    inspRestore();
+    Acq::pause();                       // nothing is read in the menu
+}
+
+static void inspToMenu() {
+    inspLeave();
+    showMenu();
+}
+
+// The tester set up on what the inspector found: its range and line type
+// as they are, AUTO at the rate the line was read at. Always AUTO, also for
+// 9600 and 19200 8N1: fixed there, a line that then changed its speed was
+// read as rubbish until left (apre-510 v0.10).
+static void inspToTester(uint8_t mode) {
+    const Insp::Found& f = Insp::found();
+    Rs232::setInverted(f.inverted);
+    speedMode = SPEED_AUTO;
+    for (uint8_t i = 0; i < sizeof(RATES) / sizeof(RATES[0]); i++)
+        if (RATES[i] == f.rateHz) rateIdx = i;
+    fromInsp = true;
+    inspRestore();
+    snap = SNAP_OFF;
+    running = true;
+    displayMode = mode;
+    Health::hint(f.baud);
+    app = APP_TESTER;
+    testerEnter();
+}
+
+// Back to the menu. What has been received and learnt is kept for next time.
+static void testerLeave() {
+    if (displayMode == MODE_HEALTH) healthLeave();
+    Acq::pause();
+}
+
+static void showMenu() {
+    app = APP_MENU;
+    Keys::sync();
+    Menu::draw(tft);
+}
+
+#ifndef RAM_RUN
+// A fault, from flash: what and where, on the screen (Probe.cpp).
+static void showFault() {
+    tft.backlight(60);
+    tft.fillScreen(0xF800);
+    tft.setTextColor(0xFFFF, 0xF800);
+    tft.setTextSize(2);
+    tft.setCursor(8, 8);
+    tft.print(FW_NAME " v" FW_VERSION " FAULT");
+    const char* const name[] = { "stage", "CFSR", "HFSR", "BFAR", "PC" };
+    const uint32_t v[] = { probe.stage, probe.fault[0], probe.fault[1], probe.fault[2], probe.fault[4] };
+    for (uint8_t i = 0; i < 5; i++) {
+        tft.setCursor(8, 40 + i * 24);
+        tft.print(name[i]);
+        tft.setCursor(80, 40 + i * 24);
+        tft.print(v[i], HEX);
+    }
+    tft.setCursor(8, 200);
+    tft.print("POWER held: off");
+}
+#endif
+
+#ifndef RAM_RUN
+extern "C" const uint32_t t232_image[];
+static int8_t imageCheck(uint32_t& got);   // below
+#endif
+
+// --- apre: the state for the page, and its commands ------------------------------
+// The state says what the instrument is doing: which app, and in the tester
+// whether it runs, holds or waits for a message, the view, the speed. It goes
+// to the page when it changes (Link::state compares), looked at ten times a
+// second; counters that move all the time are left out.
+static void stateJson(char* buf, uint16_t size) {
+    static const char* const APP[] = { "menu", "tester", "?", "sender", "settings", "insp", "logger", "game" };
+    static const char* const VIEW[] = { "prot", "hex", "chars", "large", "teach", "health" };
+    Link::Json j(buf, size);
+    j.str("t", "state").str("app", app < 8 ? APP[app] : "?");
+    if (app == APP_TESTER) {
+        const char* run = snap == SNAP_OFF ? (running ? "run" : "hold")
+                        : (snap == SNAP_DONE || snap == SNAP_SHOWN) ? "snap" : "snapWait";
+        Rs232::Format f = Rs232::format();
+        char fmt[4] = { (char)('0' + f.dataBits), f.parity, (char)('0' + f.stopBits), 0 };
+        uint32_t baud = Rs232::fixedBaud() ? Rs232::fixedBaud() : Rs232::stats().baud;
+        j.str("run", run).str("view", displayMode < 6 ? VIEW[displayMode] : "?")
+         .num("baud", (int32_t)baud).flag("auto", speedMode == SPEED_AUTO).flag("lock", speedMode == SPEED_LOCK)
+         .str("fmt", f.decided ? fmt : "").num("rateHz", (int32_t)Acq::sampleRate());
+    }
+    j.num("range", Frontend::range());
+    j.done();
+}
+
+static void sendState() {
+    static uint32_t lastMs;
+    if (millis() - lastMs < 100) return;
+    lastMs = millis();
+    char b[200];
+    stateJson(b, sizeof(b));
+    Link::state(b);
+}
+
+// "app", "to": "insp", "tester" or "menu": the app left as MODE would leave
+// it, the other opened as from the menu. Not from USB Sender (the port is
+// its own there); already there, nothing is done.
+static bool switchApp(const char* line) {
+    char to[8] = "";
+    Link::field(line, "to", to, sizeof(to));
+    uint8_t want = !strcmp(to, "insp") ? APP_INSP : !strcmp(to, "tester") ? APP_TESTER
+                 : !strcmp(to, "menu") ? APP_MENU : 0xFF;
+    if (want == 0xFF || app == APP_TTL) return false;
+    if (app == want) return true;
+    if (app == APP_TESTER)    testerLeave();
+    else if (app == APP_INSP) inspLeave();
+    else if (app == APP_LOG)  logLeave();
+    if (want == APP_TESTER)    { fromInsp = false; app = APP_TESTER; testerEnter(); }
+    else if (want == APP_INSP) { app = APP_INSP; inspEnter(); }
+    else                       showMenu();
+    return true;
+}
+
+// The page's commands: what the keys do, where they would do it. Anything
+// else is answered "ok": false.
+static bool command(const char* what, const char* line) {
+    if (!strcmp(what, "get")) {
+        char w[12] = "";
+        Link::field(line, "what", w, sizeof(w));
+        if (!strcmp(w, "insp")) { Link::sendResult(); return true; }
+        char b[200];
+        stateJson(b, sizeof(b));
+        Link::send(b);
+        return true;
+    }
+    if (app == APP_TESTER) {
+        if (!strcmp(what, "run")) {
+            Acq::pause(); snap = SNAP_OFF; running = true; Acq::resume();
+            updateStatusBar();
+            return true;
+        }
+        if (!strcmp(what, "hold")) {
+            if (snap != SNAP_OFF) return false;
+            running = false;
+            updateStatusBar();
+            return true;
+        }
+        if (!strcmp(what, "snap")) { armSnap(); updateStatusBar(); return true; }
+    }
+    if (app == APP_INSP && !strcmp(what, "again")) { Insp::again(tft); return true; }
+    if (!strcmp(what, "app")) return switchApp(line);
+    // "meter": the multimeter probe (Meter.h). "on": 0 turns it off, anything
+    // else (or nothing) on; "cmd": a function code (05xx, as the rotary switch
+    // sends them), anything else is dropped.
+    if (!strcmp(what, "meter")) {
+        if (Link::fieldNum(line, "on", 1) == 0) Meter::end();
+        else Meter::begin();
+        char c[8] = "";
+        if (Meter::on() && Link::field(line, "cmd", c, sizeof(c)) && c[0])
+            Meter::command((uint16_t)strtoul(c, nullptr, 16));
+        return true;
+    }
+    // "key", "k": up, down, left, right, ok, mode, auto, run or power, and
+    // "ms" (default 150; 1000 is a long press): the key as if pressed on the
+    // case, in whatever screen is showing (Keys::inject).
+    if (!strcmp(what, "key")) {
+        static const char* const NAME[Keys::COUNT] = { "up", "down", "left", "right", "ok", "mode", "auto", "run", "power" };
+        char k[8] = "";
+        Link::field(line, "k", k, sizeof(k));
+        int32_t ms = Link::fieldNum(line, "ms", 150);
+        if (ms < 20 || ms > 3000) return false;
+        for (uint8_t i = 0; i < Keys::COUNT; i++)
+            if (!strcmp(k, NAME[i])) { Keys::inject(i, (uint16_t)ms); return true; }
+        return false;
+    }
+    // "peek", "a" and "n" (at most 128): memory read and sent back as hex in
+    // {"t":"mem","a":...,"d":"..."}, only within the flash and the SRAM. Read
+    // only: to see what lies in flash past the tester (FAP keeps the debugger
+    // out of it), before anything is written there.
+    if (!strcmp(what, "peek")) {
+        uint32_t a = (uint32_t)Link::fieldNum(line, "a", -1);
+        int32_t  n = Link::fieldNum(line, "n", 0);
+        bool inFlash = a >= 0x08000000u && a + (uint32_t)n <= 0x08100000u;
+        bool inRam   = a >= 0x20000000u && a + (uint32_t)n <= 0x20038000u;
+        if (n <= 0 || n > 128 || !(inFlash || inRam)) return false;
+        static const char HEX_[] = "0123456789abcdef";
+        char b[48 + 2 * 128];
+        int k = snprintf(b, sizeof(b), "{\"t\":\"mem\",\"a\":%lu,\"d\":\"", (unsigned long)a);
+        const volatile uint8_t* m = (const volatile uint8_t*)a;
+        for (int32_t i = 0; i < n; i++) { uint8_t v = m[i]; b[k++] = HEX_[v >> 4]; b[k++] = HEX_[v & 15]; }
+        b[k++] = '"'; b[k++] = '}'; b[k] = 0;
+        Link::send(b);
+        return true;
+    }
+    return false;
+}
+
+#if defined(ZX) && !defined(RAM_RUN)
+static void powerOff();
+#endif
+
+void setup() {
+    // PA3, the power hold (the DSO-152's PC10, the DSO-510's PD3), is set
+    // high in SystemClock_Config (src/hw/Probe.cpp), before anything else.
+    stage(100);
+    Pins::begin();
+    Keys::begin();
+#if defined(ZX) && !defined(RAM_RUN)
+    // RUN brought the tester in; DOWN held with it asks for the Spectrum with
+    // Serpenti, UP with Zynaps (src/zx). Read now, used once the keys are let
+    // go and the clock is up.
+    delay(2);
+    uint8_t zx = Keys::down(Keys::DOWN) ? 1 : Keys::down(Keys::UP) ? 2 : 0;
+#endif
+
+    Config::load();                     // the theme, before anything is drawn
+    stage(101);
+    tft.begin();
+#ifndef RAM_RUN
+    fault_show = showFault;
+#endif
+    stage(102);
+    tft.fillScreen(0);
+    tft.backlight(60);
+    dataBuffer[0] = 0;
+
+#ifdef USBCON
+    usbFix();                           // the receive path, made to work on this chip
+    SerialUSB.begin();
+#endif
+
+    Frontend::begin();
+    stage(103);
+    Rs232::begin();
+#ifndef DEMO_SIGNAL
+    Acq::onBlock(onBlock);
+#endif
+    stage(104);
+    Acq::begin(RATES[rateIdx]);
+    Acq::pause();                       // nothing is read until the inspector is started
+    stage(105);
+
+    Menu::about(tft);                   // a second of About, then the menu
+    uint32_t aboutMs = millis();
+    stage(106);
+    // started at 72 MHz with the screen set up there; now 240 (Probe.cpp)
+    // Not while a key is held. Switched at once, with RUN and POWER still
+    // held from the start, the unit went off as soon as the menu was drawn,
+    // from flash on battery every time (v0.06, 2026-10-29); after the keys
+    // were let go, 0.47..1.1 s in, it started six times out of six (v0.08).
+    // Whether the keys or the time is what matters is not known.
+    for (bool any = true; any || millis() - aboutMs < 1000; ) {
+        IWDG->KR = 0xAAAA;
+        any = false;
+        for (uint8_t k = 0; k < Keys::COUNT; k++) if (Keys::down(k)) any = true;
+    }
+    uint8_t clk = clock240();
+    tft.backlight(60);                  // its PWM counts from the clock
+#ifdef CAL_OUT
+    CalOut::apply();                    // on the backlight's timer, or its own: after the clock
+#endif
+#if defined(ZX) && !defined(RAM_RUN)
+    if (zx) Zx::run(tft, powerOff, (uint8_t)(zx - 1));     // never returns
+#endif
+    Acq::setSampleRate(RATES[rateIdx]);
+#ifndef RAM_RUN
+    uint32_t crc = 0;
+    Menu::image = imageCheck(crc);
+#endif
+    // Startup (Settings): AprecID or the Logger at once, unless the start has
+    // something to say, which is said on the menu.
+    bool trouble = clk != 0;
+#ifndef RAM_RUN
+    if (Menu::image < 0) trouble = true;
+#endif
+    bool toLog = Config::startup == Config::START_LOG;
+    if (trouble || Config::startup == Config::START_MENU || (toLog && Menu::ITEM_LOG < 0)) showMenu();
+    else if (toLog) logEnter();
+    else if (Config::startup == Config::START_GAME) { app = APP_GAME; Game::enter(tft); }
+    else { app = APP_INSP; inspEnter(); }
+#ifndef RAM_RUN
+    if (Menu::image < 0) {              // part of the tester did not arrive: said, with what was found
+        tft.setTextSize(1);
+        tft.setTextColor(0xFFFF, 0xF800);
+        tft.setCursor(4, 218);
+        tft.print(" image: CRC "); tft.print(crc, HEX); tft.print(", want "); tft.print(t232_image[1], HEX);
+        tft.print(", "); tft.print(t232_image[0]); tft.print(" bytes ");
+    }
+#endif
+    if (clk) {                          // a wait gave up (Probe.cpp): said, the unit left on
+        tft.setTextSize(1);
+        tft.setTextColor(0xFFFF, 0xF800);
+        tft.setCursor(4, 230);
+        tft.print(" 240 MHz: wait "); tft.print(clk); tft.print(" gave up, CR "); tft.print(RCC->CR, HEX); tft.print(' ');
+    }
+    stage(107);
+    Link::onCommand(command);           // the page's commands (apre protocol 1)
+    probe.magic = kMagicRun;            // for the RAM loader
+}
+
+static bool testerLoop();
+
+#ifndef RAM_RUN
+// Whether the update wrote the whole tester: its CRC-32 against the one
+// make_update.py put in the record (src/boot/BootStub.S), with the three
+// words it wrote taken as they were built. The image runs past 512 kB into
+// the second bank of the flash, which the FNIRSI bootloader writes with
+// registers of its own; this is the proof that it did.
+extern "C" const uint32_t g_pfnVectors[];
+extern "C" const uint32_t t232_fnirsi_main[], t232_image[];
+
+static int8_t imageCheck(uint32_t& got) {
+    const uint32_t len = t232_image[0], want = t232_image[1];
+    if (len == 0xFFFFFFFF || len > 0x100000) return 0;
+    const uint8_t* p = (const uint8_t*)g_pfnVectors;
+    const uint8_t* skip1 = (const uint8_t*)t232_fnirsi_main;
+    const uint8_t* skip2 = (const uint8_t*)t232_image;
+    static const uint32_t T[16] = {
+        0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC, 0x76DC4190, 0x6B6B51F4, 0x4DB26158, 0x5005713C,
+        0xEDB88320, 0xF00F9344, 0xD6D6A3E8, 0xCB61B38C, 0x9B64C2B0, 0x86D3D2D4, 0xA00AE278, 0xBDBDF21C };
+    uint32_t crc = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < len; i++) {
+        const uint8_t* a = p + i;
+        uint8_t b = (a >= skip1 && a < skip1 + 4) || (a >= skip2 && a < skip2 + 8) ? 0xFF : *a;
+        crc = T[(crc ^ b) & 15] ^ (crc >> 4);
+        crc = T[(crc ^ (b >> 4)) & 15] ^ (crc >> 4);
+        if (!(i & 0x3FFF)) IWDG->KR = 0xAAAA;
+    }
+    got = ~crc;
+    return got == want ? 1 : -1;
+}
+#endif
+
+#ifndef RAM_RUN
+static void powerOff() {
+    tft.backlight(0);
+    tft.fillScreen(0);
+    GPIOA->BRR = 1u << 3;           // PA3: the DST-210's power hold, and PB12 (FNIRSI 0x0801DB98)
+    GPIOB->BRR = 1u << 12;
+    // Then a reset, once the power key has been let go for a tenth of a
+    // second; the bootloader, finding it up, leaves the unit off. Staying in
+    // a loop here, the watchdog fed, as up to v0.23, the core never started
+    // again (3V3 stays on): the next press of the key powered the rest of the
+    // board, the screen flashed white, and on letting go it was off again,
+    // which looked like a unit that would not start (2026-10-27). The FNIRSI
+    // firmware stops feeding the watchdog instead.
+    uint32_t up = 0;
+    while (up < 100) {
+        IWDG->KR = 0xAAAA;
+        up = Pins::read(PIN_A(6)) ? up + 1 : 0;
+        delay(1);
+    }
+    NVIC_SystemReset();
+}
+#endif
+
+void loop() {
+    Beep::poll();
+    if (app != APP_TTL) {               // the results to the page on the PC; USB Sender has the port to itself
+        sendState();
+        Link::poll();
+        Meter::poll();
+    }
+    IWDG->KR = 0xAAAA;                  // the FNIRSI firmware started it; it cannot be stopped
+    probe.loops++;
+    probe.ms = millis();
+#ifdef USBCON
+    usbWatch();                         // a control request left unanswered: off USB and back
+#endif
+
+#ifndef RAM_RUN
+    // The power key held for two seconds switches the unit off, the way the
+    // FNIRSI firmware does it (0x0801DB98): PA3 (the power hold) and PB12 low.
+    // The key itself keeps the power on until it is let go, so the watchdog
+    // is fed till then; a reset would start FNIRSI.
+    static uint32_t powerSince = 0;
+    if (!Pins::read(PIN_A(6))) {
+        if (!powerSince) powerSince = millis() | 1;
+        else if (millis() - powerSince > 2000) powerOff();
+    } else {
+        powerSince = 0;
+    }
+
+    // Auto off (Settings): any key down, anything new in the buffer, or a
+    // new result of the inspector, is the unit being used.
+    static uint32_t usedMs = 0, usedResults = 0;
+    static int      usedLen = 0;
+    bool used = bufferIndex != usedLen || Insp::results() != usedResults;
+    for (uint8_t k = 0; k < Keys::COUNT && !used; k++) used = Keys::down(k);
+    if (used) { usedMs = millis(); usedLen = bufferIndex; usedResults = Insp::results(); }
+    uint32_t offMs = Config::autoOffMs();
+    if (offMs && millis() - usedMs > offMs) powerOff();
+#endif
+
+    switch (app) {
+        case APP_MENU: {
+            int8_t pick = Menu::poll(tft);
+            if (pick == Menu::ITEM_TESTER)   { fromInsp = false; app = APP_TESTER; testerEnter(); }
+            else if (pick == Menu::ITEM_INSP) { app = APP_INSP;  inspEnter(); }
+            else if (pick == Menu::ITEM_SET) { app = APP_SET;    Settings::enter(tft, bufferIndex); }
+            else if (Menu::ITEM_LOG >= 0 && pick == Menu::ITEM_LOG) logEnter();
+            else if (Menu::ITEM_GAME >= 0 && pick == Menu::ITEM_GAME) { app = APP_GAME; Game::enter(tft); }
+#ifndef NO_USB_SENDER
+            else if (pick == Menu::ITEM_TTL) { Link::flush(100); app = APP_TTL; Ttl::enter(tft, dataBuffer, bufferIndex); }
+#endif
+            break;
+        }
+#ifndef NO_USB_SENDER
+        case APP_TTL:
+            if (!Ttl::poll(tft, dataBuffer, bufferIndex)) { Ttl::leave(); showMenu(); }
+            break;
+#endif
+        case APP_SET: {
+            uint8_t r = Settings::poll(tft);
+            if (r == Settings::ERASE)      { eraseBuffer(); Settings::erased(tft); }
+            else if (r == Settings::LEAVE) showMenu();
+            break;
+        }
+        case APP_TESTER:
+            if (!testerLoop()) { testerLeave(); showMenu(); }
+            break;
+        case APP_GAME:
+            if (!Game::poll(tft)) showMenu();
+            break;
+        case APP_LOG:
+            if (!Logger::poll(tft)) { logLeave(); showMenu(); }
+            break;
+        case APP_INSP: {
+            uint8_t r = Insp::poll(tft);
+            if (r == Insp::MENU)        inspToMenu();
+            else if (r == Insp::TESTER) inspToTester(MODE_PROT);
+            else if (r == Insp::TESTER_TEACH) inspToTester(MODE_TEACH);
+            else if (r == Insp::TESTER_HEALTH) inspToTester(MODE_HEALTH);
+            break;
+        }
+    }
+}
+
+// One turn of the inspector. False: OK was held, back to the menu.
+static bool testerLoop() {
+
+    if (displayMode == MODE_HEALTH) {
+        Health::poll(tft);
+    } else {
+#ifndef DEMO_SIGNAL
+    if (running && Acq::interruptDriven()) {
+        drainDecoder();
+        if (snapReady) {
+            snapReady = false;
+            if (wavesShown()) paintWaves();
+            Link::wave(waveSnap, waveN, Acq::sampleRate(), "tester", "live", true);   // the page on the PC
+            lastWaveMs = millis();
+        } else if (!wantSnap && snap == SNAP_OFF
+                   && ((wavesShown() && (millis() - lastWaveMs) >= waveEveryMs()) || Link::wantsWave())) {
+            wantSnap = true;
+        }
+    } else
+#endif
+    if (running) {
+        uint16_t n;
+        bool over = false;
+#ifdef DEMO_SIGNAL
+        const uint16_t* half = demoBlock(n, Acq::sampleRate());
+        delay(2);                       // roughly the pace of a real block
+#else
+        const uint16_t* half = Acq::readyHalf(n, over);
+#endif
+        if (half) {
+            if (over) Rs232::noteOverrun();
+            Rs232::feed(half, n, Acq::sampleRate());
+            drainDecoder();
+
+            // Painted here rather than later: the bit marks and the byte
+            // positions belong to the feed just done, and the next one would
+            // replace them.
+            uint32_t now = millis();
+            if (snap != SNAP_OFF) {
+                snapBlock(half, n, over);
+            } else if (wavesShown() && (now - lastWaveMs) >= waveEveryMs()) {
+                lastWaveMs = now;
+                waveN = n > (uint16_t)(Acq::BUF_LEN / 2) ? (uint16_t)(Acq::BUF_LEN / 2) : n;
+                memcpy(waveSnap, half, (size_t)waveN * sizeof(uint16_t));
+                Rs232::latchView();
+                paintWaves();
+            }
+        }
+    }
+    }
+
+    if (snap == SNAP_DONE) showSnap();
+
+    // MODE changes the view; held while a capture is awaited, it sends the
+    // made-up message below instead of waiting for a real one.
+    uint8_t mode = Keys::press(Keys::MODE);
+    if (mode == Keys::SHORT && fromInsp && nextMode(displayMode) == MODE_PROT) {
+        // opened from AprecID: past the last view, back there, to look again
+        testerLeave();
+        displayMode = MODE_PROT;
+        fromInsp = false;
+        app = APP_INSP;
+        inspEnter();
+        return true;
+    }
+    if (mode == Keys::SHORT) {
+        setMode(nextMode(displayMode));
+    } else if (mode == Keys::LONG && snap == SNAP_ARMED) {
+        simulateMessage();
+    }
+
+    if (Keys::hit(Keys::RUN)) {
+        if (displayMode == MODE_HEALTH) {
+            Health::restart(tft);                   // the figures start again
+        } else if (snap == SNAP_OFF && running) {
+            running = false;                        // RUN -> HOLD
+            updateStatusBar();
+        } else if (snap == SNAP_OFF || snap == SNAP_SHOWN) {
+            armSnap();                              // HOLD -> SNAP, or once more
+        } else {
+            Acq::pause();                           // still waiting -> RUN
+            snap    = SNAP_OFF;
+            running = true;
+            Acq::resume();
+            updateStatusBar();
+        }
+    }
+
+    // In the teaching view, with the picture still, left and right go from one
+    // character of it to the next instead of changing the range.
+    if (displayMode == MODE_TEACH && !running) {
+        int8_t d = Keys::hit(Keys::RIGHT) ? 1 : Keys::hit(Keys::LEFT) ? -1 : 0;
+        if (d && Teach::step(d)) Teach::draw(tft, waveSnap, waveN, true);
+    } else {
+    if (Keys::hit(Keys::RIGHT)) {
+        if (Frontend::range() < Frontend::RANGE_MAX) {
+            Frontend::setRange((uint8_t)(Frontend::range() + 1));
+            relearn();
+        }
+        updateStatusBar();
+        if (displayMode == MODE_HEALTH) Health::restart(tft);
+    }
+
+    if (Keys::hit(Keys::LEFT)) {
+        if (Frontend::range() > 0) {
+            Frontend::setRange((uint8_t)(Frontend::range() - 1));
+            relearn();
+        }
+        updateStatusBar();
+        if (displayMode == MODE_HEALTH) Health::restart(tft);
+    }
+    }
+
+    // In the teaching view up and down move the threshold instead of the rate.
+    if (displayMode == MODE_TEACH) {
+        int8_t d = Keys::hit(Keys::UP) ? 1 : Keys::hit(Keys::DOWN) ? -1 : 0;
+        if (d) moveThreshold(d);
+    } else if (displayMode != MODE_HEALTH) {        // the health view keeps its own rate
+    if (Keys::hit(Keys::UP)) {
+        if (rateIdx + 1 < (uint8_t)(sizeof(RATES) / sizeof(RATES[0]))) {
+            rateIdx++;
+            Acq::setSampleRate(RATES[rateIdx]);
+            Acq::pause();
+            Rs232::reset();
+            Acq::resume();
+        }
+        updateStatusBar();
+    }
+
+    if (Keys::hit(Keys::DOWN)) {
+        if (rateIdx > 0) {
+            rateIdx--;
+            Acq::setSampleRate(RATES[rateIdx]);
+            Acq::pause();
+            Rs232::reset();
+            Acq::resume();
+        }
+        updateStatusBar();
+    }
+    }
+
+    // AUTO changes the speed when let go; held in the teaching view, it gives
+    // the threshold back to the middle of the levels.
+    uint8_t autoKey = Keys::press(Keys::AUTO);
+    if (autoKey == Keys::SHORT) {
+        Rs232::Stats  ls = Rs232::stats();
+        Rs232::Format lf = Rs232::format();
+        if (speedMode == SPEED_AUTO && ls.locked && ls.baud && lf.decided) {
+            lockBaud = ls.baud;             // A has found the line: L keeps it
+            lockFmt  = lf;
+            speedMode = SPEED_LOCK;
+        } else {
+            speedMode = speedMode == SPEED_9600 ? SPEED_19200 : speedMode == SPEED_19200 ? SPEED_AUTO : SPEED_9600;
+        }
+        applySpeedMode();
+        updateStatusBar();
+        if (displayMode == MODE_TEACH) Teach::draw(tft, waveSnap, waveN, !running);
+        if (displayMode == MODE_HEALTH) {           // the speed mode set its own rate
+            Acq::setSampleRate(Health::SAMPLE_HZ);
+            Acq::discard();
+            Health::restart(tft);
+        }
+    } else if (autoKey == Keys::LONG && displayMode == MODE_TEACH) {
+        setThresholdTo(0);
+    }
+
+    // OK held goes back to the menu, so a short press is acted on when the
+    // button comes up, not when it goes down.
+    uint8_t ok = Keys::press(Keys::OK);
+    if (ok == Keys::LONG) return false;
+    if (ok == Keys::SHORT) {
+        Rs232::setInverted(!Rs232::inverted());   // RS232 swing, or plain TTL
+        relearn();
+        updateStatusBar();
+        if (displayMode == MODE_HEALTH) Health::restart(tft);
+    }
+
+    if (Keys::hit(Keys::RELEARN)) {
+        Acq::pause();
+        Rs232::reset();                     // measure the speed and shape again
+        Acq::resume();
+        updateStatusBar();
+        if (displayMode == MODE_HEALTH) Health::restart(tft);
+    }
+
+    // Nothing is painted while a picture is awaited or being filled: above
+    // IRQ_MAX_HZ the halves are fetched by this loop, and one that went by
+    // during a repaint would cut the picture short.
+    if (snap == SNAP_ARMED || snap == SNAP_FILL || snap == SNAP_TAIL) return true;
+
+    autoRate();
+    updateDisplay();
+    refreshStatusBar();
+
+    // A picture is up and has been drawn with the text it brought: wait for
+    // the next message at once (not in the teaching view, where one character
+    // of the picture is being looked at).
+    if (snap == SNAP_SHOWN && displayMode != MODE_TEACH) rearmSnap();
+    return true;
+}
