@@ -4,9 +4,10 @@ I wrote an alternative firmware that turns the FNIRSI DST-210 (oscilloscope, mul
 signal generator in one) into a pocket line identifier, an RS232/TTL serial tester and a logger
 of current and voltage. It also plays a game.
 
-> **Use at your own risk.** This is a hobby project, not affiliated with FNIRSI, and there is no
-> warranty of any kind. It is an alternative firmware: it is installed through the FNIRSI update,
-> and a mistake there is yours to put right.
+> **Use at your own risk.** APRE-210 is an alternative firmware, a hobby project not affiliated
+> with or endorsed by FNIRSI. It comes with no warranty of any kind, and I accept no liability for
+> any damage to your unit, to what you connect it to, or for anything that follows from its
+> readings.
 
 Touch a wire with the probe and **AprecID** tells what it is: GND, a supply rail, an RS232 or TTL
 serial line with its speed and frame, Modbus RTU, RS485, CAN, I2C, LIN, PWM. A serial line is read
@@ -27,6 +28,24 @@ The same as a video: [`docs/demo.mp4`](docs/demo.mp4).
 > DST-210's board, which [dst210-tester232u](https://github.com/zeromem0/dst210-tester232u) first
 > worked out. Its beginnings go back to David's
 > [dso152-breakout](https://github.com/davidgiven/dso152-breakout).
+
+## Is it safe?
+
+- **The official firmware stays.** APRE-210 is added next to it; the unit starts the FNIRSI
+  firmware as before, and APRE-210 only when RUN is held at power-on.
+- **The FNIRSI bootloader is never touched**, neither by the update file nor by APRE-210, and the
+  update itself is FNIRSI's own (MODE held at power-on). So the unit can always be put back: the
+  same steps with the original FNIRSI file.
+- **The calibration is never touched**: neither the scope's settings page nor the multimeter
+  chip's. APRE-210 only reads the scope's calibration, and sends the multimeter only the knob
+  functions the FNIRSI firmware sends.
+- **What it has been tried on:** FNIRSI application V0.1.0, on a unit with board `DST_210_V1.1`
+  and 1 MB of flash, updated with new versions many times over. Check your FNIRSI version first:
+  if it is newer than V0.1.0, do not put an update file made from V0.1.0 on it. Keep the original
+  FNIRSI `.zip`: it is the way back.
+- **It is not a calibrated instrument.** AprecID, the Logger and the scope's DC voltmeter are for
+  finding your way, not for measurements that matter: check those with a calibrated meter. The
+  input limits of the DST-210 stay as FNIRSI gives them.
 
 ## What it does
 
